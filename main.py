@@ -681,6 +681,12 @@ B1完美图形匹配:
         default=None,
         help=f'B1完美图形匹配的回看天数 (默认: {default_lookback_days})'
     )
+    
+    parser.add_argument(
+        '--security-keyword',
+        default='A股',
+        help='飞书机器人安全关键词 (默认: A股)'
+    )
 
     args = parser.parse_args()
 
@@ -734,7 +740,8 @@ B1完美图形匹配:
                 from utils.feishu_notifier import FeishuNotifier
                 feishu_cfg = quant.config.get('feishu', {})
                 webhook_url = os.environ.get('FEISHU_WEBHOOK') or feishu_cfg.get('webhook_url', '')
-                notifier = FeishuNotifier(webhook_url)
+                security_keyword = args.security_keyword
+                notifier = FeishuNotifier(webhook_url, security_keyword)
 
                 # 加载策略中文名称映射
                 display_names = {}

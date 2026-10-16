@@ -17,7 +17,7 @@ dingtalk:
 # 飞书机器人配置
 # 在飞书群中添加自定义机器人，复制 webhook URL
 feishu:
-  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/ef0d8206-3c26-4fa0-9401-138f997db920"
+  webhook_url: "YOUR_FEISHU_WEBHOOK_URL_HERE"  # 请替换为实际的webhook URL
 
 # 定时任务配置
 schedule:

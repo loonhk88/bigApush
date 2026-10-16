@@ -37,5 +37,5 @@ jobs:
       - name: Run selection and push
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-        run: python main.py run
+        run: python main.py run --security-keyword "A股"
         timeout-minutes: 30
