@@ -99,6 +99,10 @@ def send_feishu(msg):
     if not webhook:
         print("FEISHU_WEBHOOK 未设置")
         return False
+    # 处理飞书安全关键词：消息开头自动添加关键词
+    keyword = "A股"
+    if keyword not in msg:
+        msg = f"{keyword}\n{msg}"
     resp = requests.post(
         webhook,
         json={"msg_type": "text", "content": {"text": msg}},
