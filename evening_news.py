@@ -115,7 +115,7 @@ def main():
     lines = []
 
     # 标题
-    lines.append(f"🌙 晚间缅A ({now.strftime('%Y-%m-%d')})")
+    lines.append(f"🌙 晚间新闻 ({now.strftime('%Y-%m-%d')})")
     lines.append("")
 
     # 今日大盘收盘
