@@ -757,7 +757,7 @@ B1完美图形匹配:
                 except Exception:
                     pass
 
-                lines = [f"📊 缅A每日推送 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
+                lines = [f"📊 A股量化选股结果 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
                 total = 0
                 all_stocks = []
                 if isinstance(result, dict):
