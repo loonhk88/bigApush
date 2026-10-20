@@ -2,6 +2,14 @@ name: 收盘选股
 
 on:
   workflow_dispatch:
+  # 兜底：外部定时器失效时，工作日 15:40（北京时间）自己跑一次
+  # schedule:
+  #   - cron: '40 7 * * 1-5'
+
+# runner 默认 UTC。不设 TZ 的话，代码里的 datetime.now() 会比北京时间慢 8 小时，
+# 曾经因此把 17:30 误判成"还没收盘"，导致数据更新天天被跳过。
+env:
+  TZ: Asia/Shanghai
 
 jobs:
   run-selection:
