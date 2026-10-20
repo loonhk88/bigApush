@@ -142,6 +142,8 @@ class DataInitializer:
         success_count = 0
         failed_count = 0
         total_inserted = 0
+        # 记录未取到K线的股票，主流程结束后统一重试一次，便于定位与补救
+        failed_codes = []
         # fallback_mode: 是否已降级到腾讯财经
         fallback_mode = False
         # 连续 TickFlow 失败计数（用于判断是否永久降级）
@@ -320,8 +322,10 @@ class DataInitializer:
 
                 # ============ 步骤3: 统计与进度 ============
                 # 统计批次中本批无数据的股票数（不在 kline_dict 即为最终失败）
-                batch_failed_count = len([c for c in batch_codes if c not in kline_dict])
+                batch_failed_codes = [c for c in batch_codes if c not in kline_dict]
+                batch_failed_count = len(batch_failed_codes)
                 failed_count += batch_failed_count
+                failed_codes.extend(batch_failed_codes)
 
                 total_inserted += batch_inserted
 
@@ -361,6 +365,58 @@ class DataInitializer:
                         time_module.sleep(backoff)
                     else:
                         consecutive_empty_tencent = 0
+
+            # ============ 步骤4: 对缺失K线的股票重试一次 ============
+            # 主流程里 TickFlow 偶发漏单很常见，换腾讯财经再补一次，能救回大部分
+            # 整个重试阶段独立 try：即使这里出错也不影响已经写入的数据和后续选股
+            if failed_codes:
+                logger.warning(f"本次有 {len(failed_codes)} 只股票未取得K线，开始重试（腾讯财经，2线程）...")
+                recovered_codes = set()
+                try:
+                    retry_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
+                        failed_codes, years=years, concurrency=2
+                    ) or {}
+
+                    if retry_dict:
+                        from utils.date_utils import normalize_date
+                        retry_sql = """
+                        INSERT OR REPLACE INTO stock_kline
+                        (code, date, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """
+                        with self.db_manager.transaction():
+                            conn = self.db_manager.connect()
+                            cursor = conn.cursor()
+                            for code, df_kline in retry_dict.items():
+                                try:
+                                    if df_kline is None or len(df_kline) == 0:
+                                        continue
+                                    records = list(zip(
+                                        [code] * len(df_kline),
+                                        df_kline['date'].apply(
+                                            lambda x: normalize_date(x) if x is not None else None),
+                                        df_kline['open'].astype(float),
+                                        df_kline['high'].astype(float),
+                                        df_kline['low'].astype(float),
+                                        df_kline['close'].astype(float),
+                                        df_kline['volume'].fillna(0).astype(int),
+                                    ))
+                                    cursor.executemany(retry_sql, records)
+                                    total_inserted += len(records)
+                                    success_count += 1
+                                    recovered_codes.add(code)
+                                except Exception as e:
+                                    logger.debug(f"重试保存 {code} K线失败: {e}")
+                except Exception as e:
+                    logger.warning(f"失败股票重试阶段出错，跳过重试（不影响主流程）: {e}")
+
+                still_failed = [c for c in failed_codes if c not in recovered_codes]
+                logger.info(f"重试结果: 补回 {len(recovered_codes)} 只，仍缺失 {len(still_failed)} 只")
+                if still_failed:
+                    logger.warning(
+                        f"以下 {len(still_failed)} 只股票所有数据源均无K线（多为停牌/退市/新股上市不足），本次跳过: "
+                        f"{still_failed[:50]}{' …' if len(still_failed) > 50 else ''}"
+                    )
 
             # 计算最终失败数
             final_failed = total - success_count

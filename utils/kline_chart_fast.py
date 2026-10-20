@@ -136,7 +136,7 @@ def generate_kline_chart_fast(
 # 测试
 if __name__ == '__main__':
     import sys
-    sys.path.insert(0, '/root/quant-csv')
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     
     import time
     from utils.db_manager import DBManager
