@@ -15,8 +15,18 @@ import argparse
 import platform
 import logging
 from pathlib import Path
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta, timezone
 import time
+
+# 北京时区。GitHub Actions runner 时区是 UTC，直接用 datetime.now() 会把
+# 「北京时间 17:30」判断成「UTC 09:30」，从而永远认为还没收盘、跳过数据更新。
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def _now_cn():
+    """返回北京时间的当前 datetime（不依赖运行机器的本地时区）"""
+    return datetime.now(CN_TZ)
+
 
 # 配置日志
 logging.basicConfig(
@@ -58,6 +68,8 @@ class QuantSystem:
         from utils.global_db import get_global_db
         self.db_manager = get_global_db()
         self.fetcher = AKShareFetcher(self.data_dir)
+        # 最近一次选股所用的数据日期（YYYY-MM-DD），用于推文里标注数据时效
+        self.data_date = None
         self.registry = get_registry("config/strategy_params.yaml")
         # 初始化CSV管理器
         from utils.csv_manager import CSVManager
@@ -98,55 +110,36 @@ class QuantSystem:
         print("\n✓ 数据初始化完成")
 
     def _smart_update(self, max_stocks=None, check_latest=True):
-        """智能更新：3点前不更新，检查每只股票是否有当天数据"""
-        from datetime import datetime
-        import pandas as pd
+        """智能更新：收盘前不更新；以数据库最新K线日期判断是否需要增量更新"""
+        today = _now_cn().date()
+        current_time = _now_cn().time()
+        market_close_time = dt_time(15, 0)
 
-        today = datetime.now().date()
-        current_time = datetime.now().time()
-        market_close_time = datetime.strptime("15:00", "%H:%M").time()
-
-        # 3点前：不更新，使用旧数据
+        # 北京时间 15:00 前不更新，使用旧数据
         if current_time < market_close_time:
-            print("\n⏰ 当前时间尚未收盘 (15:00)")
+            print("\n⏰ 当前时间尚未收盘 (北京时间 15:00)")
             print("  使用本地已有数据，跳过网络更新")
             return
 
-        # 检查每只股票是否有当天数据
+        # 判断数据库是否落后：直接比最新K线日期，与运行机器时区无关
         if check_latest:
             print("\n🔍 检查数据更新状态...")
-            # 从数据库获取所有股票代码
-            stock_codes = self.db_manager.list_all_stocks()
-            if max_stocks:
-                stock_codes = stock_codes[:max_stocks]
+            from utils.trading_time_validator import TradingTimeValidator
+            latest_date = TradingTimeValidator(self.db_manager).get_last_update_date()
+            self.data_date = latest_date or None
+            print(f"  数据库最新K线日期: {latest_date or '空'}（目标交易日: {today}）")
 
-            total = len(stock_codes)
-            has_today = 0
-            no_today = 0
-            check_limit = min(100, total)  # 抽样检查100只
-
-            for code in stock_codes[:check_limit]:
-                # 从数据库读取股票数据
-                df = self.db_manager.read_stock(code)
-                if not df.empty:
-                    latest_date = pd.to_datetime(df.iloc[0]['date']).date()
-                    if latest_date == today:
-                        has_today += 1
-                    else:
-                        no_today += 1
-
-            # 如果100%股票都有今天数据，跳过更新
-            if check_limit > 0 and has_today == check_limit:
-                print(f"  ✓ 已检查 {check_limit} 只股票，全部已有今天数据")
+            if latest_date and latest_date >= today.isoformat():
                 print("  数据已是最新，跳过网络更新")
                 return
-            else:
-                print(f"  已检查 {check_limit} 只，{has_today} 只有今天数据，{no_today} 只需要更新")
+
+            print("  ⚠ 数据落后于今天，需要更新")
 
         # 执行更新
         print("\n🔄 执行数据更新...")
         self.fetcher.init_full_data(max_stocks=max_stocks, incremental=True)
         print("\n✓ 数据更新完成")
+        self.data_date = _now_cn().date().isoformat()
 
     def update_data(self, max_stocks=None):
         """每日增量更新"""
@@ -757,7 +750,10 @@ B1完美图形匹配:
                 except Exception:
                     pass
 
-                lines = [f"📊 A股量化选股结果 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
+                _data_date = getattr(quant, 'data_date', None)
+                lines = [f"📊 A股量化选股结果 ({_now_cn().strftime('%Y-%m-%d %H:%M:%S')})", ""]
+                lines.append(f"📅 数据截至: {_data_date or '未知'}")
+                lines.append("")
                 total = 0
                 all_stocks = []
                 if isinstance(result, dict):
