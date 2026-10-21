@@ -44,4 +44,4 @@ jobs:
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: python main.py run --security-keyword "A股"
-        timeout-minutes: 30
+        timeout-minutes: 50
