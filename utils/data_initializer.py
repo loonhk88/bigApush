@@ -22,6 +22,9 @@ class StaleDataSourceError(RuntimeError):
 # 单批次内"看不到基准日"的股票占比超过该阈值，即判定为数据源时效问题
 # （正常停牌股占比远低于此值，10-22 事故时是 100%）
 STALE_RATIO_THRESHOLD = 0.5
+# 只有"最后一根K线距基准日不超过这么多天"的股票才算可疑落后；
+# 差得更远的一律按长期停牌/退市处理，避免成批的停牌股被误判成数据源故障
+STALE_GAP_DAYS = 7
 # 时效探测取样股票数（同时向 TickFlow 与腾讯财经索取，比对最新K线日期）
 PROBE_SAMPLE_SIZE = 30
 
@@ -458,21 +461,43 @@ class DataInitializer:
                 # ============ 步骤1.5: 逐批时效校验（防止数据源"成功但返回旧数据"）============
                 # 10-22 事故根因：TickFlow 全天返回截至 10-21 的数据，api_ok 一直是 True，
                 # 于是拿 10-21 的行情算出了 10-22 的选股结果。这里必须比日期。
+                #
+                # 但"看不到基准日"不等于"数据源有问题"：长期停牌/退市的票本来就没有当日K线，
+                # 而缺口规划会把它们排在最后几批（缺口最大），一旦按整批占比判定就会误报
+                # （10-22 18:30 那轮：批次53 的 93 只全是停牌股，被判成"全线滞后"）。
+                # 所以只把"最近 STALE_GAP_DAYS 天内还有K线、却缺了基准日"的算作可疑落后。
                 if target_date and kline_dict:
-                    batch_stale = [c for c in kline_dict if _df_max_date(kline_dict[c]) is None
-                                   or _df_max_date(kline_dict[c]) < target_date]
+                    batch_stale = []
+                    inactive_n = 0
+                    for _code, _df in kline_dict.items():
+                        _max_d = _df_max_date(_df)
+                        if _max_d is None or _max_d >= target_date:
+                            continue
+                        try:
+                            _gap_days = (datetime.strptime(target_date, '%Y-%m-%d')
+                                         - datetime.strptime(_max_d, '%Y-%m-%d')).days
+                        except Exception:
+                            _gap_days = 9999
+                        if _gap_days <= STALE_GAP_DAYS:
+                            batch_stale.append(_code)
+                        else:
+                            inactive_n += 1
+
+                    active_n = len(kline_dict) - inactive_n
                     if batch_stale:
                         stale_n = len(batch_stale)
-                        stale_ratio = stale_n / len(kline_dict)
+                        # 分母只算"本该有当日K线"的活跃股票，停牌股不参与
+                        stale_ratio = (stale_n / active_n) if active_n else 0.0
                         logger.info(
-                            f"批次{batch_num} 时效校验: 最新 {len(kline_dict) - stale_n} 只 / "
-                            f"落后(<{target_date}) {stale_n} 只 ({stale_ratio:.0%})"
+                            f"批次{batch_num} 时效校验: 最新 {active_n - stale_n} 只 / "
+                            f"可疑落后(<{target_date}，距基准≤{STALE_GAP_DAYS}天) {stale_n} 只 / "
+                            f"长期停牌 {inactive_n} 只 ({stale_ratio:.0%})"
                         )
                         if stale_ratio >= STALE_RATIO_THRESHOLD:
                             stale_batches += 1
                             logger.warning("=" * 50)
                             logger.warning(
-                                f"!!! 批次{batch_num}: {stale_n}/{len(kline_dict)} 只看不到 {target_date}，"
+                                f"!!! 批次{batch_num}: {stale_n}/{active_n} 只活跃股票看不到 {target_date}，"
                                 f"判定为数据源时效问题，改用腾讯财经重新获取 !!!"
                             )
                             logger.warning("=" * 50)
@@ -480,9 +505,9 @@ class DataInitializer:
                                 kline_dict, batch_stale, target_date, batch_num, fallback_years)
                             if fixed_n == 0:
                                 raise StaleDataSourceError(
-                                    f"数据源全线滞后：TickFlow 与腾讯财经都拿不到 {target_date} 的K线"
-                                    f"（批次{batch_num}，{stale_n} 只样本全部落后），"
-                                    f"已中止本次运行，避免用旧数据选股"
+                                    f"数据源滞后：TickFlow 与腾讯财经都拿不到 {target_date} 的K线"
+                                    f"（批次{batch_num}，{stale_n} 只活跃股票全部落后，"
+                                    f"另有 {inactive_n} 只长期停牌），已中止本次运行，避免用旧数据选股"
                                 )
                             # 本轮剩余批次直接走腾讯财经，不再逐批先撞一次 TickFlow
                             if not fallback_mode:
@@ -491,6 +516,9 @@ class DataInitializer:
                                 )
                                 fallback_mode = True
                                 tencent_locked = True
+                    elif inactive_n:
+                        logger.debug(
+                            f"批次{batch_num}: {inactive_n} 只长期停牌股无 {target_date} 数据，正常跳过")
 
                 # ============ 步骤2: 批量写入数据库（executemany 高效模式）============
                 batch_inserted = 0
