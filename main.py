@@ -110,7 +110,11 @@ class QuantSystem:
         print("\n✓ 数据初始化完成")
 
     def _smart_update(self, max_stocks=None, check_latest=True):
-        """智能更新：收盘前不更新；以数据库最新K线日期判断是否需要增量更新"""
+        """智能更新：收盘前不更新；更新后必须复核数据库最新K线日期
+
+        复核不过就中止本次运行 —— 宁可今天不出选股结果，
+        也不能拿昨天的行情当今天的结果（2026-10-22 事故教训）。
+        """
         today = _now_cn().date()
         current_time = _now_cn().time()
         market_close_time = dt_time(15, 0)
@@ -121,15 +125,17 @@ class QuantSystem:
             print("  使用本地已有数据，跳过网络更新")
             return
 
+        from utils.trading_time_validator import TradingTimeValidator
+        target = today.isoformat()
+
         # 判断数据库是否落后：直接比最新K线日期，与运行机器时区无关
         if check_latest:
             print("\n🔍 检查数据更新状态...")
-            from utils.trading_time_validator import TradingTimeValidator
             latest_date = TradingTimeValidator(self.db_manager).get_last_update_date()
             self.data_date = latest_date or None
-            print(f"  数据库最新K线日期: {latest_date or '空'}（目标交易日: {today}）")
+            print(f"  数据库最新K线日期: {latest_date or '空'}（目标交易日: {target}）")
 
-            if latest_date and latest_date >= today.isoformat():
+            if latest_date and latest_date >= target:
                 print("  数据已是最新，跳过网络更新")
                 return
 
@@ -137,9 +143,48 @@ class QuantSystem:
 
         # 执行更新
         print("\n🔄 执行数据更新...")
-        self.fetcher.init_full_data(max_stocks=max_stocks, incremental=True)
-        print("\n✓ 数据更新完成")
-        self.data_date = _now_cn().date().isoformat()
+        update_error = None
+        try:
+            self.fetcher.init_full_data(max_stocks=max_stocks, incremental=True)
+        except Exception as e:
+            update_error = e
+            print(f"\n⚠ 数据更新过程报错: {e}")
+            print("  继续做更新后复核，数据若已到位仍可正常选股…")
+
+        # ==================== 更新后复核（关键）====================
+        # 数据层可能"打印了完成但一条新数据都没写"（例如数据源返回旧数据），
+        # 这里必须再查一次数据库的真实最新K线日期，绝不能无条件认定更新成功。
+        validated = TradingTimeValidator(self.db_manager).get_last_update_date()
+        print(f"\n🔍 更新后复核：数据库最新K线日期 {validated or '空'}（目标交易日: {target}）")
+
+        if validated and validated >= target:
+            print(f"\n✓ 数据更新完成（数据截至 {validated}）")
+            self.data_date = validated
+            return
+
+        # 各数据源当前能看到的最新日期（由 DataInitializer 的时效探测回写），仅用于诊断信息
+        latest_available = self._source_latest_available_date()
+
+        print("\n" + "!" * 60)
+        print(f"✗ 数据更新失败：数据库最新K线日期 {validated or '空'}，目标交易日 {target}")
+        print(f"  数据源当前能看到的最新日期: {latest_available or '未知'}")
+        print("  数据源返回了旧数据，或更新未生效。为避免用旧数据选股，本次运行已中止。")
+        print("!" * 60)
+        self.data_date = validated or None
+        raise RuntimeError(
+            f"数据未更新到 {target}（数据库最新 {validated or '空'}，"
+            f"数据源最新 {latest_available or '未知'}），已中止选股"
+            + (f"；原始错误: {update_error}" if update_error else "")
+        )
+
+    def _source_latest_available_date(self):
+        """本轮各数据源能看到的最新K线日期（DataInitializer 时效探测回写，未探测到返回 None）"""
+        data_fetcher = getattr(self.fetcher, 'stock_data_fetcher', None)
+        for obj in (data_fetcher, self.fetcher):
+            value = getattr(obj, 'latest_available_date', None)
+            if value:
+                return value
+        return None
 
     def update_data(self, max_stocks=None):
         """每日增量更新"""
