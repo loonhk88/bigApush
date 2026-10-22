@@ -283,6 +283,11 @@ class DataInitializer:
         default_days = years * 250
         # 增量模式下每只股票各自的抓取根数
         days_map = days_map or {}
+        # 降级到腾讯财经时用多少年：增量只补缺口（最多 260 根）时按 1 年（365 根）抓即可，
+        # 单请求体积小一半以上，也能压住"全天走腾讯财经"时的总耗时
+        fallback_years = years
+        if days_map and max(days_map.values()) <= 300:
+            fallback_years = 1
         total = len(stock_codes)
         progress_start, progress_end = progress_range
         success_count = 0
@@ -389,7 +394,7 @@ class DataInitializer:
                             fallback_mode = True
                             # 用腾讯财经获取当前批次
                             kline_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                                batch_codes, years=years, concurrency=2
+                                batch_codes, years=fallback_years, concurrency=2
                             )
                             tencent_hit = len(kline_dict)
                             logger.info(
@@ -402,7 +407,7 @@ class DataInitializer:
                                 f"本批临时降级到腾讯财经，下批恢复 TickFlow"
                             )
                             kline_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                                batch_codes, years=years, concurrency=2
+                                batch_codes, years=fallback_years, concurrency=2
                             )
                             tencent_hit = len(kline_dict)
                             logger.info(
@@ -433,19 +438,19 @@ class DataInitializer:
                                 logger.warning("批次{batch_num}: TickFlow 恢复探测成功但完整批次失败，维持降级")
                                 fallback_mode = True
                                 kline_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                                    batch_codes, years=years, concurrency=2
+                                    batch_codes, years=fallback_years, concurrency=2
                                 )
                                 tencent_hit = len(kline_dict)
                         else:
                             logger.debug(f"批次{batch_num}: TickFlow 仍未恢复，继续使用腾讯财经")
                             kline_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                                batch_codes, years=years, concurrency=2
+                                batch_codes, years=fallback_years, concurrency=2
                             )
                             tencent_hit = len(kline_dict)
                     else:
                         # 直接使用腾讯财经
                         kline_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                            batch_codes, years=years, concurrency=2
+                            batch_codes, years=fallback_years, concurrency=2
                         )
                         tencent_hit = len(kline_dict)
                         logger.info(f"批次{batch_num}: 腾讯财经(降级模式) 获取 {tencent_hit}/{len(batch_codes)} 只")
@@ -472,7 +477,7 @@ class DataInitializer:
                             )
                             logger.warning("=" * 50)
                             fixed_n = self._repair_batch_by_tencent(
-                                kline_dict, batch_stale, target_date, batch_num, years)
+                                kline_dict, batch_stale, target_date, batch_num, fallback_years)
                             if fixed_n == 0:
                                 raise StaleDataSourceError(
                                     f"数据源全线滞后：TickFlow 与腾讯财经都拿不到 {target_date} 的K线"
@@ -581,7 +586,7 @@ class DataInitializer:
                 recovered_codes = set()
                 try:
                     retry_dict = self.stock_data_fetcher._fetch_stock_batch_tencent(
-                        failed_codes, years=years, concurrency=2
+                        failed_codes, years=fallback_years, concurrency=2
                     ) or {}
 
                     if retry_dict:
