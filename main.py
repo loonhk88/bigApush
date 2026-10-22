@@ -110,14 +110,22 @@ class QuantSystem:
         print("\n✓ 数据初始化完成")
 
     def _smart_update(self, max_stocks=None, check_latest=True):
-        """智能更新：收盘前不更新；更新后必须复核数据库最新K线日期
+        """智能更新：收盘前不更新；用"目标交易日的股票覆盖率"判断数据是否到位
 
         复核不过就中止本次运行 —— 宁可今天不出选股结果，
         也不能拿昨天的行情当今天的结果（2026-10-22 事故教训）。
+
+        为什么不用 MAX(date) 判断：K线最后会用腾讯财经补回取不到的那几十只股票，
+        它们会带上当天数据，把 MAX(date) 顶到今天，而其余几千只仍停在昨天。
+        2026-10-22 就是这样被判定成"数据已是最新"，整天用了 10-21 的行情。
         """
         today = _now_cn().date()
         current_time = _now_cn().time()
         market_close_time = dt_time(15, 0)
+
+        # 判定"数据已到位"的最低覆盖率：目标交易日有K线的股票占全部有历史数据股票的比例。
+        # 长期停牌的股票占比很低的（通常 1-2%），80% 留足余量又不会放过"只更新了几十只"的假象。
+        MIN_COVERAGE = 0.80
 
         # 北京时间 15:00 前不更新，使用旧数据
         if current_time < market_close_time:
@@ -128,18 +136,24 @@ class QuantSystem:
         from utils.trading_time_validator import TradingTimeValidator
         target = today.isoformat()
 
-        # 判断数据库是否落后：直接比最新K线日期，与运行机器时区无关
+        # 判断数据是否落后：比覆盖率，不看 MAX(date)
         if check_latest:
             print("\n🔍 检查数据更新状态...")
             latest_date = TradingTimeValidator(self.db_manager).get_last_update_date()
+            covered, total, ratio = self._data_coverage(target)
             self.data_date = latest_date or None
             print(f"  数据库最新K线日期: {latest_date or '空'}（目标交易日: {target}）")
+            print(f"  {target} 覆盖率: {covered}/{total} 只（{ratio:.1%}）")
 
-            if latest_date and latest_date >= target:
-                print("  数据已是最新，跳过网络更新")
+            if ratio >= MIN_COVERAGE:
+                print(f"  {target} 数据已到位（覆盖 {ratio:.1%}），跳过网络更新")
+                self.data_date = target
                 return
 
-            print("  ⚠ 数据落后于今天，需要更新")
+            if latest_date and latest_date >= target:
+                print(f"  ⚠ 虽有 {latest_date} 的K线，但只覆盖 {ratio:.1%}，属于个别股票被补回，仍需更新")
+            else:
+                print(f"  ⚠ 数据落后于今天（覆盖仅 {ratio:.1%}），需要更新")
 
         # 执行更新
         print("\n🔄 执行数据更新...")
@@ -152,30 +166,64 @@ class QuantSystem:
             print("  继续做更新后复核，数据若已到位仍可正常选股…")
 
         # ==================== 更新后复核（关键）====================
-        # 数据层可能"打印了完成但一条新数据都没写"（例如数据源返回旧数据），
-        # 这里必须再查一次数据库的真实最新K线日期，绝不能无条件认定更新成功。
-        validated = TradingTimeValidator(self.db_manager).get_last_update_date()
-        print(f"\n🔍 更新后复核：数据库最新K线日期 {validated or '空'}（目标交易日: {target}）")
+        # 数据层可能"打印了完成但只写了零头"（数据源返回旧数据、只补回个别股票），
+        # 这里必须按覆盖率复核，绝不能无条件认定更新成功。
+        covered, total, ratio = self._data_coverage(target)
+        print(f"\n🔍 更新后复核：{target} 覆盖 {covered}/{total} 只（{ratio:.1%}）")
 
-        if validated and validated >= target:
-            print(f"\n✓ 数据更新完成（数据截至 {validated}）")
-            self.data_date = validated
+        if ratio >= MIN_COVERAGE:
+            print(f"\n✓ 数据更新完成（{target} 覆盖 {ratio:.1%}）")
+            self.data_date = target
             return
 
         # 各数据源当前能看到的最新日期（由 DataInitializer 的时效探测回写），仅用于诊断信息
         latest_available = self._source_latest_available_date()
 
         print("\n" + "!" * 60)
-        print(f"✗ 数据更新失败：数据库最新K线日期 {validated or '空'}，目标交易日 {target}")
-        print(f"  数据源当前能看到的最新日期: {latest_available or '未知'}")
+        print(f"✗ 数据更新失败：{target} 只有 {covered}/{total} 只股票有K线（{ratio:.1%}），"
+              f"低于要求的 {MIN_COVERAGE:.0%}")
+        print(f"  数据库最新K线日期: {latest_available or '未知'}")
         print("  数据源返回了旧数据，或更新未生效。为避免用旧数据选股，本次运行已中止。")
         print("!" * 60)
-        self.data_date = validated or None
+        self.data_date = None
         raise RuntimeError(
-            f"数据未更新到 {target}（数据库最新 {validated or '空'}，"
+            f"{target} 数据覆盖不足（{covered}/{total} 只，{ratio:.1%} < {MIN_COVERAGE:.0%}，"
             f"数据源最新 {latest_available or '未知'}），已中止选股"
             + (f"；原始错误: {update_error}" if update_error else "")
         )
+
+    def _data_coverage(self, target):
+        """统计"目标交易日及之后有K线"的股票数
+
+        返回 (covered, total, ratio)
+        - covered: 最新K线日期 >= target 的股票数
+        - total:   库里有历史K线的股票总数（作为分母；长期停牌/退市靠 80% 阈值消化）
+
+        说明：stock_kline 没有 (code, date) 索引，所以用一条语句一次扫描拿到两个数，
+        避免全表扫两三遍。
+        """
+        covered = 0
+        total = 0
+        try:
+            rows = self.db_manager.query(
+                "SELECT COUNT(DISTINCT code) AS total,"
+                " COUNT(DISTINCT CASE WHEN date >= ? THEN code END) AS covered"
+                " FROM stock_kline", (target,))
+            if rows:
+                total = int(rows[0].get('total') or 0)
+                covered = int(rows[0].get('covered') or 0)
+        except Exception as e:
+            print(f"  ⚠ 统计目标日覆盖率失败: {e}")
+            try:
+                rows = self.db_manager.query(
+                    "SELECT COUNT(DISTINCT code) AS c FROM stock_kline WHERE date >= ?", (target,))
+                covered = int(rows[0]['c'] or 0) if rows else 0
+                rows = self.db_manager.query("SELECT COUNT(DISTINCT code) AS c FROM stock_kline")
+                total = int(rows[0]['c'] or 0) if rows else 0
+            except Exception as e2:
+                print(f"  ⚠ 覆盖率兜底统计失败: {e2}")
+        ratio = (covered / total) if total else 0.0
+        return (covered, total, ratio)
 
     def _source_latest_available_date(self):
         """本轮各数据源能看到的最新K线日期（DataInitializer 时效探测回写，未探测到返回 None）"""
