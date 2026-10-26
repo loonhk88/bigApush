@@ -14,7 +14,9 @@ env:
 jobs:
   run-selection:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 必须大于下面选股步骤的 timeout（90)，否则步骤级放宽会被 job 级先掐掉。
+    # 选股步骤 90 + 依赖安装/缓存恢复/缓存保存约 5 分钟，留 15 分钟余量。
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,4 +46,7 @@ jobs:
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: python main.py run --security-keyword "A股"
-        timeout-minutes: 50
+        # 2026-10-26 运行 #16 失败根因：主数据源当日K线未就绪，被迫全量降级腾讯财经，
+        # 该模式实测约 88 秒/100 只，5401 只需 54 批 ≈ 79 分钟，50 分钟预算必然打满超时。
+        # 本仓库为 public，Actions 分钟数不计量，放宽到 90 分钟零成本。
+        timeout-minutes: 90
