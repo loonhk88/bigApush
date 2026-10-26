@@ -821,6 +821,76 @@ class DataInitializer:
         logger.info(f"K线缺口规划: {desc}")
         return (days_map, desc)
 
+    def _get_kline_max_date(self) -> str:
+        """读取 stock_kline 表中最新的K线日期。
+
+        口径必须与下游 utils/trading_time_validator.py 的 get_last_update_date() 一致，
+        因为下游正是拿这个值判断"数据是否落后"，两边口径不一致就会出现
+        "刚补完数据、下游仍认为落后、于是再全量补一遍"的重复劳动。
+        """
+        try:
+            rows = self.db_manager.query("SELECT MAX(date) AS max_date FROM stock_kline")
+            if rows:
+                return _norm_date(rows[0].get('max_date')) or ''
+        except Exception as e:
+            logger.warning(f"读取K线最新日期失败: {e}")
+        return ''
+
+    def _ensure_kline_fresh(self, codes: list, before_date: str, years: int,
+                            days_map: dict, progress_range: tuple,
+                            max_tries: int = 2, wait_seconds: int = 60) -> None:
+        """补缺口之后校验数据是否真的落到了最新交易日；没落地就地重试，交给下游只跑一次。
+
+        背景（2026-10-26 事故）：补缺口阶段逐批时效校验通过、日志显示写入 17 万条，
+        但补完后 stock_kline 的 MAX(date) 仍是上一交易日，下游 _smart_update 据此
+        判定"数据落后"，又把同样的缺口全量补了一遍，白烧 10 分钟以上，
+        而这 10 分钟正是把 50 分钟预算打满、导致工作流超时的直接原因。
+
+        判据用"补前 vs 补后 MAX(date) 是否有推进"，不引入交易日历：
+        - 有推进：本次补缺确实落库，放行；
+        - 没推进且本来就落后今日：说明数据源当日K线尚未发布，短睡眠后重试；
+        - 补前已是最新（重复运行）：直接跳过，不空转。
+        """
+        import time as time_module
+
+        now = datetime.now()
+        if now.weekday() >= 5:
+            logger.info("今天为周末，跳过K线落库校验")
+            return
+
+        today = now.strftime('%Y-%m-%d')
+        if before_date and before_date >= today:
+            logger.info(f"K线落库校验跳过: 补前已是最新 {before_date}")
+            return
+
+        latest = self._get_kline_max_date()
+        if latest and latest > (before_date or ''):
+            logger.info(f"K线落库校验通过: 最新 {latest}（补前 {before_date or '空'}）")
+            return
+
+        for attempt in range(1, max_tries + 1):
+            logger.warning(
+                f"K线落库校验未通过: 最新 {latest or '空'} 未超过补前 {before_date or '空'}，"
+                f"第 {attempt}/{max_tries} 次重试（等待 {wait_seconds}s 让数据源发布当日数据）"
+            )
+            time_module.sleep(wait_seconds)
+            try:
+                self._init_kline_history_data(
+                    codes, years=years, progress_range=progress_range, days_map=days_map)
+            except StaleDataSourceError as e:
+                logger.warning(f"第 {attempt} 次重试仍判定数据源滞后: {e}")
+            latest = self._get_kline_max_date()
+            if latest and latest > (before_date or ''):
+                logger.info(
+                    f"K线落库校验通过（第 {attempt} 次重试）: 最新 {latest}（补前 {before_date or '空'}）")
+                return
+
+        raise StaleDataSourceError(
+            f"K线落库校验失败: {max_tries} 次重试后最新仍为 {latest or '空'}，"
+            f"未超过补前 {before_date or '空'}。已中止本次运行，避免用旧数据出选股结果。"
+            f"通常是数据源当日K线尚未发布，可稍后重跑。"
+        )
+
     # ==================== 统一初始化入口 ====================
     
     def init_full_data(self, max_stocks: Optional[int] = None, years: int = 3,
@@ -904,9 +974,14 @@ class DataInitializer:
                 old_codes.sort(key=lambda c: days_map.get(c, years * 250))
                 self._report_progress(
                     stages[1], f"正在补K线缺口（{len(old_codes)} 只 / {gap_desc}）...")
+                # 记录补前的最新K线日期，补完据此校验数据是否真的落库（见 _ensure_kline_fresh）
+                kline_date_before = self._get_kline_max_date()
                 self._init_kline_history_data(old_codes, years=years,
                                               progress_range=(stages[1], stages[2]),
                                               days_map=days_map)
+                self._ensure_kline_fresh(
+                    old_codes, kline_date_before, years, days_map,
+                    progress_range=(stages[1], stages[2]))
             self._report_progress(stages[2], "K线数据初始化完成")
             
             # 3. 初始化行业数据
